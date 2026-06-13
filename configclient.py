@@ -374,35 +374,13 @@ def _aes_gcm_decrypt_pure(key: bytes, nonce: bytes, ciphertext: bytes, aad: byte
 
 def aes_gcm_encrypt(plaintext: str, key: bytes) -> str:
     try:
-        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-        nonce = os.urandom(NONCE_LEN)
-        aesgcm = AESGCM(key)
-        ct_with_tag = aesgcm.encrypt(nonce, plaintext.encode("utf-8"), b"")
-        raw = nonce + ct_with_tag
-        b64 = base64.b64encode(raw).decode("ascii")
-        return ENC_PREFIX + ENC_VERSION_PREFIX + b64
-    except ImportError:
-        pass
-
-    try:
-        from Crypto.Cipher import AES
-        nonce = os.urandom(NONCE_LEN)
-        cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
-        ct, tag = cipher.encrypt_and_digest(plaintext.encode("utf-8"))
-        raw = nonce + ct + tag
-        b64 = base64.b64encode(raw).decode("ascii")
-        return ENC_PREFIX + ENC_VERSION_PREFIX + b64
-    except ImportError:
-        pass
-
-    try:
         nonce = os.urandom(NONCE_LEN)
         ct, tag = _aes_gcm_encrypt_pure(key, nonce, plaintext.encode("utf-8"), b"")
         raw = nonce + ct + tag
         b64 = base64.b64encode(raw).decode("ascii")
         return ENC_PREFIX + ENC_VERSION_PREFIX + b64
     except Exception as e:
-        log_warn(f"Pure-python AES-GCM encrypt failed: {e}")
+        log_warn(f"AES-GCM encrypt failed: {e}")
         return ""
 
 
@@ -432,32 +410,13 @@ def aes_gcm_decrypt(enc_value: str, key: Optional[bytes] = None) -> Optional[str
             log_warn("CONFIG_KEY not set, cannot decrypt")
             return None
     try:
-        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-        aesgcm = AESGCM(key)
-        pt = aesgcm.decrypt(nonce, ct + tag, b"")
-        return pt.decode("utf-8")
-    except ImportError:
-        pass
-    except Exception as e:
-        log_warn(f"cryptography decrypt failed: {e}")
-    try:
-        from Crypto.Cipher import AES
-        cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
-        try:
-            pt = cipher.decrypt_and_verify(ct, tag)
-            return pt.decode("utf-8")
-        except Exception:
-            return None
-    except ImportError:
-        pass
-    try:
         pt = _aes_gcm_decrypt_pure(key, nonce, ct, b"", tag)
         if pt is None:
             log_warn("Tag verification failed during decryption")
             return None
         return pt.decode("utf-8")
     except Exception as e:
-        log_warn(f"Pure-python AES-GCM decrypt failed: {e}")
+        log_warn(f"AES-GCM decrypt failed: {e}")
         return None
 
 
@@ -560,40 +519,67 @@ def _validate_value(v: Any, ctx: str) -> Tuple[bool, List[str]]:
     return False, errs
 
 
-def fetch_remote(url: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+def fetch_remote(url: str, etag: Optional[str] = None) -> Tuple[Optional[Dict[str, Any]], Optional[str], Optional[str]]:
+    """Fetch config from remote HTTP endpoint.
+
+    Returns: (config_dict_or_none, error_message_or_none, new_etag_or_none)
+    If remote returns 304 Not Modified, config is None and error is None.
+    """
     try:
         req = urllib.request.Request(url, method="GET")
+        if etag:
+            req.add_header("If-None-Match", etag)
         resp = urllib.request.urlopen(req, timeout=CONNECT_TIMEOUT)
         try:
+            sock = getattr(resp, "fp", None)
+            if sock and hasattr(sock, "_sock"):
+                raw_sock = sock._sock
+                if hasattr(raw_sock, "settimeout"):
+                    raw_sock.settimeout(READ_TIMEOUT)
             raw = resp.read()
         except socket.timeout:
-            return None, "Read timeout while reading remote response"
+            try:
+                resp.close()
+            except Exception:
+                pass
+            return None, "Read timeout while reading remote response", None
         except Exception as e:
-            return None, f"Failed to read remote response: {e}"
+            try:
+                resp.close()
+            except Exception:
+                pass
+            return None, f"Failed to read remote response: {e}", None
+        code = resp.getcode()
+        new_etag = resp.headers.get("ETag") if hasattr(resp, "headers") else None
+        if code == 304:
+            return None, None, new_etag
         try:
             cfg = json.loads(raw.decode("utf-8"))
         except json.JSONDecodeError as e:
-            return None, f"Remote response is not valid JSON: {e}"
+            return None, f"Remote response is not valid JSON: {e}", new_etag
         except Exception as e:
-            return None, f"Failed to parse remote response: {e}"
-        return cfg, None
+            return None, f"Failed to parse remote response: {e}", new_etag
+        return cfg, None, new_etag
     except urllib.error.HTTPError as e:
-        return None, f"Remote HTTP error: {e.code} {e.reason}"
+        if e.code == 304:
+            new_etag = e.headers.get("ETag") if e.headers else None
+            return None, None, new_etag
+        return None, f"Remote HTTP error: {e.code} {e.reason}", None
     except urllib.error.URLError as e:
         reason = e.reason
         if isinstance(reason, socket.timeout):
-            return None, f"Connection timeout to {url}"
-        return None, f"Remote unreachable: {reason}"
+            return None, f"Connection timeout to {url}", None
+        return None, f"Remote unreachable: {reason}", None
     except socket.timeout:
-        return None, f"Connection timeout to {url}"
+        return None, f"Connection timeout to {url}", None
     except ssl.SSLError as e:
-        return None, f"SSL error: {e}"
+        return None, f"SSL error: {e}", None
     except PermissionError:
-        return None, "Permission denied while connecting to remote"
+        return None, "Permission denied while connecting to remote", None
     except OSError as e:
-        return None, f"OS error connecting to remote: {e}"
+        return None, f"OS error connecting to remote: {e}", None
     except Exception as e:
-        return None, f"Unexpected error fetching remote: {e}"
+        return None, f"Unexpected error fetching remote: {e}", None
 
 
 def push_remote(url: str, config: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
@@ -714,8 +700,11 @@ class ConfigClient:
         self._source = "none"
         self._remote_url = remote_url
         self._dry_run = dry_run
+        self._etag: Optional[str] = None
+        self._last_version: Optional[int] = None
         self._watch_thread: Optional[threading.Thread] = None
         self._watch_stop = threading.Event()
+        self._async_load_thread: Optional[threading.Thread] = None
         self._allow_push = False
         self._local_modified = False
         self._fail_count = 0
@@ -773,6 +762,10 @@ class ConfigClient:
                 self._config["version"] = cur_v + 1
             self._config["updated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
             self._local_modified = True
+            snapshot = dict(self._config)
+        ok, err = save_cache(snapshot)
+        if not ok and err:
+            log_warn(f"Failed to persist local change to cache: {err}")
 
     def _apply_config(self, config: Dict[str, Any], source: str) -> bool:
         if self._dry_run:
@@ -807,29 +800,47 @@ class ConfigClient:
         self._apply_config(cfg, "cache")
         return True, None
 
-    def load_from_remote(self, save_history: bool = True) -> Tuple[bool, Optional[str]]:
+    def load_from_remote(self, save_history_flag: bool = True) -> Tuple[bool, Optional[str]]:
         if not self._remote_url:
             return False, "No remote URL configured"
-        cfg, err = fetch_remote(self._remote_url)
+        with self._lock:
+            current_etag = self._etag
+        cfg, err, new_etag = fetch_remote(self._remote_url, etag=current_etag)
         if err:
             return False, err
         if cfg is None:
-            return False, "Remote returned no config"
+            if new_etag:
+                with self._lock:
+                    self._etag = new_etag
+            return True, None
+        if new_etag:
+            with self._lock:
+                self._etag = new_etag
         ok, verrs = validate_config(cfg)
         if not ok:
             for e in verrs:
                 log_warn(f"Remote validation warning: {e}")
             return False, "Remote config validation failed, keeping previous config"
+        new_ver = cfg.get("version")
+        with self._lock:
+            old_ver = self._last_version
+        if (isinstance(old_ver, int) and not isinstance(old_ver, bool)
+            and isinstance(new_ver, int) and not isinstance(new_ver, bool)
+            and new_ver == old_ver):
+            return True, None
         changed = self._apply_config(cfg, "remote")
-        if changed and save_history:
+        if changed and save_history_flag:
             save_history(cfg)
-            ok, e = save_cache(cfg)
-            if not ok and e:
-                log_warn(f"Failed to update local cache after remote fetch: {e}")
+            ok_save, e_save = save_cache(cfg)
+            if not ok_save and e_save:
+                log_warn(f"Failed to update local cache after remote fetch: {e_save}")
         elif self._loaded:
-            ok, e = save_cache(cfg)
-            if not ok and e:
-                log_warn(f"Failed to update local cache: {e}")
+            ok_save, e_save = save_cache(cfg)
+            if not ok_save and e_save:
+                log_warn(f"Failed to update local cache: {e_save}")
+        if isinstance(new_ver, int) and not isinstance(new_ver, bool):
+            with self._lock:
+                self._last_version = new_ver
         return True, None
 
     def start_watch(self, allow_push: bool = False) -> None:
@@ -840,6 +851,26 @@ class ConfigClient:
         self._watch_thread = threading.Thread(target=self._watch_loop, name="configclient-watch", daemon=True)
         self._watch_thread.start()
         log_info(f"Watch mode started (interval={int(self._watch_interval_normal)}s, allow_push={allow_push})")
+
+    def load_from_remote_async(self, save_history_flag: bool = True) -> None:
+        if self._async_load_thread is not None and self._async_load_thread.is_alive():
+            return
+        self._async_load_thread = threading.Thread(
+            target=self._async_load_worker,
+            args=(save_history_flag,),
+            name="configclient-async-load",
+            daemon=True,
+        )
+        self._async_load_thread.start()
+
+    def _async_load_worker(self, save_history_flag: bool) -> None:
+        ok, err = self.load_from_remote(save_history_flag=save_history_flag)
+        if ok:
+            with self._lock:
+                v = self._config.get("version")
+            log_info(f"Async remote load complete, version={v}")
+        else:
+            log_warn(f"Async remote load failed: {err}")
 
     def stop_watch(self) -> None:
         self._watch_stop.set()

@@ -69,18 +69,29 @@ class MockConfigHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         log_info(f"[mock] {self.address_string()} - {format % args}")
 
-    def _send_json(self, status: int, data: dict):
+    def _send_json(self, status: int, data: dict, etag: Optional[str] = None):
         body = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        if etag:
+            self.send_header("ETag", etag)
         self.end_headers()
         self.wfile.write(body)
 
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path in ("/", "/api/config", "/config"):
-            self._send_json(200, MOCK_DEFAULT_CONFIG)
+            import hashlib
+            body_str = json.dumps(MOCK_DEFAULT_CONFIG, ensure_ascii=False, sort_keys=True)
+            etag = '"' + hashlib.md5(body_str.encode("utf-8")).hexdigest() + '"'
+            if_none_match = self.headers.get("If-None-Match")
+            if if_none_match and if_none_match == etag:
+                self.send_response(304)
+                self.send_header("ETag", etag)
+                self.end_headers()
+                return
+            self._send_json(200, MOCK_DEFAULT_CONFIG, etag=etag)
         else:
             self._send_json(404, {"error": "not found"})
 
@@ -129,29 +140,36 @@ def cmd_run(args) -> int:
     ok, err = client.load_from_cache()
     if ok:
         source_used = "cache"
-        log_info("Loaded configuration from local cache")
+        log_info("Loaded configuration from local cache (fast path)")
     elif err:
         load_errors.append(f"Cache: {err}")
 
-    if args.remote and not args.mock_remote:
-        ok, err = client.load_from_remote(save_history=True)
-        if ok:
-            source_used = "remote"
-            log_info("Loaded configuration from remote endpoint")
-        elif err:
-            load_errors.append(f"Remote: {err}")
-            log_warn(f"Remote fetch failed: {err}")
-
     if args.mock_remote:
         mock_cfg = dict(MOCK_DEFAULT_CONFIG)
-        ok, errs = validate_config(mock_cfg)
-        if ok:
+        ok_m, errs_m = validate_config(mock_cfg)
+        if ok_m:
             client._apply_config(mock_cfg, "mock")
             source_used = "mock"
             log_info("Loaded mock configuration")
         else:
-            for e in errs:
+            for e in errs_m:
                 log_warn(f"Mock config validation warning: {e}")
+
+    one_shot_mode = args.print_config or args.dry_run
+
+    if args.remote and not args.mock_remote:
+        if one_shot_mode:
+            ok_r, err_r = client.load_from_remote(save_history_flag=True)
+            if ok_r:
+                if client.config_source == "remote" or source_used == "none":
+                    source_used = "remote"
+                log_info("Loaded configuration from remote endpoint (synchronous)")
+            elif err_r:
+                load_errors.append(f"Remote: {err_r}")
+                log_warn(f"Remote fetch failed: {err_r}")
+        else:
+            client.load_from_remote_async(save_history_flag=True)
+            log_info("Remote fetch running in background, will update when ready")
 
     if not client.is_loaded:
         log_error("Failed to load configuration from any source.")
@@ -349,6 +367,18 @@ def cmd_rollback(args) -> int:
         for e in verrs:
             log_warn(f"Rollback target validation warning: {e}")
 
+    if args.dry_run:
+        log_info(f"[dry-run] Would roll back to version {target}")
+        log_info(f"Target updated_at: {target_cfg.get('updated_at')}")
+        cur_cfg, cerr = load_cache()
+        if cur_cfg is not None:
+            log_info(f"Current version: {cur_cfg.get('version')}, updated_at: {cur_cfg.get('updated_at')}")
+        else:
+            log_info("No current cache, would create new.")
+        print(json.dumps(target_cfg, ensure_ascii=False, indent=2))
+        log_info("[dry-run] No files were modified.")
+        return EXIT_OK
+
     log_info(f"About to roll back to version {target}")
     log_info(f"Target updated_at: {target_cfg.get('updated_at')}")
 
@@ -366,11 +396,6 @@ def cmd_rollback(args) -> int:
         if answer not in ("y", "yes"):
             log_info("Rollback cancelled by user.")
             return EXIT_OK
-
-    if args.dry_run:
-        log_info(f"[dry-run] Would roll back to version {target}")
-        print(json.dumps(target_cfg, ensure_ascii=False, indent=2))
-        return EXIT_OK
 
     client = ConfigClient(remote_url=args.remote, dry_run=False)
     client._apply_config(target_cfg, f"rollback:{target}")
